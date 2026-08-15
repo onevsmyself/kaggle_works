@@ -336,7 +336,7 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
             use_best_model=True,
         )
         pred_cv[val_idx] = model.predict(X.iloc[val_idx])
-        test_preds += model.predict(X_test) / len(folds)  # среднее по фолдам → меньше переобучение
+        test_preds += model.predict(X_test) / len(folds)  # среднее по фолдам - меньше переобучение
         print(f"  CatBoost fold {fold} MAE: {mean_absolute_error(y[val_idx], pred_cv[val_idx]):,.0f}")
 
     return pred_cv, test_preds
