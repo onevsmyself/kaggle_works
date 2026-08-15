@@ -9,25 +9,28 @@ from pathlib import Path
 from scipy.optimize import minimize
 from sklearn.metrics import mean_absolute_error
 
-# Параметры обучения и валидации
+# параметры
 N_FOLDS = 5  # количество временных фолдов
 TEMPORAL_CUTOFF = "2012-2"  # дата отсечки для оценки mae
 CHECKPOINT_DIR = Path("checkpoints")  # прогресс между запусками
-RESUME_FROM_CHECKPOINT = False  # True = не переделывать уже готовые этапы
-FRESH_START = True  # True = удалить checkpoints и обучить всё с нуля
+RESUME_FROM_CHECKPOINT = False
+FRESH_START = True
 
-# Настройки моделей
-EARLY_STOPPING = 200  # через сколько итераций останавливаем
+# общее для моделей
+ITERS = 5000
+EARLY_STOPPING = 200
 RANDOM_STATE = 42
+MIN_DATA_IN_LEAF = 30
+LEARNING_RATE = 0.03
 
 CATBOOST_PARAMS = {
     "loss_function": "MAE",
     "eval_metric": "MAE",
-    "iterations": 5000,
-    "learning_rate": 0.03,
+    "iterations": ITERS,
+    "learning_rate": LEARNING_RATE,
     "depth": 7,
     "l2_leaf_reg": 8,
-    "min_data_in_leaf": 30,
+    "min_data_in_leaf": MIN_DATA_IN_LEAF,
     "bagging_temperature": 1.0,
     "random_strength": 2.0,
     "verbose": 0,
@@ -38,17 +41,16 @@ CATBOOST_PARAMS = {
 LIGHTGBM_PARAMS = {
     "objective": "regression_l1",
     "metric": "mae",
-    "n_estimators": 5000,
-    "learning_rate": 0.03,
+    "n_estimators": ITERS,
+    "learning_rate": LEARNING_RATE,
     "num_leaves": 63,
     "max_depth": 8,
-    "min_data_in_leaf": 30,
+    "min_data_in_leaf": MIN_DATA_IN_LEAF,
     "feature_fraction": 0.6,
     "bagging_fraction": 0.6,
     "bagging_freq": 1,
     "reg_alpha": 0.2,
     "reg_lambda": 0.2,
-    "n_jobs": -1,
     "verbose": -1,
     "random_state": RANDOM_STATE,
 }
@@ -56,31 +58,30 @@ LIGHTGBM_PARAMS = {
 XGBOOST_PARAMS = {
     "objective": "reg:absoluteerror",
     "eval_metric": "mae",
-    "n_estimators": 5000,
-    "learning_rate": 0.03,
+    "n_estimators": ITERS,
+    "learning_rate": LEARNING_RATE,
     "max_depth": 7,
-    "min_child_weight": 30,
+    "min_child_weight": MIN_DATA_IN_LEAF,
     "subsample": 0.6,
     "colsample_bytree": 0.6,
     "reg_alpha": 0.2,
     "reg_lambda": 0.2,
     "enable_categorical": True,
     "tree_method": "hist",
-    "n_jobs": -1,
     "early_stopping_rounds": EARLY_STOPPING,
     "random_state": RANDOM_STATE,
 }
 
 
-def make_catboost(seed: int) -> CatBoostRegressor:
+def make_catboost() -> CatBoostRegressor:
     return CatBoostRegressor(**CATBOOST_PARAMS)
 
 
-def make_lightgbm(seed: int) -> lgb.LGBMRegressor:
+def make_lightgbm() -> lgb.LGBMRegressor:
     return lgb.LGBMRegressor(**LIGHTGBM_PARAMS)
 
 
-def make_xgboost(seed: int) -> xgb.XGBRegressor:
+def make_xgboost() -> xgb.XGBRegressor:
     return xgb.XGBRegressor(**XGBOOST_PARAMS)
 
 
@@ -126,15 +127,17 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return train, test
 
 
-def add_base_features(df: pd.DataFrame) -> pd.DataFrame:
+def add_base_features(df: pd.DataFrame, origin_month: int | None = None) -> pd.DataFrame:
     out = df.copy()
 
-    # Разбираем date стандартного вида на год и месяц
     parts = out["date"].str.split("-", expand=True).astype(int)
     out["year"] = parts[0]
     out["month"] = parts[1]
-    out["year_month_idx"] = out["year"] * 12 + out["month"]  # только номер месяца
-    out["months_from_start"] = out["year_month_idx"] - out["year_month_idx"].min()
+    out["year_month_idx"] = out["year"] * 12 + out["month"]
+    if origin_month is None:
+        origin_month = int(out["year_month_idx"].min())
+        
+    out["months_from_start"] = out["year_month_idx"] - origin_month
 
     out["area_x_rooms"] = out["area"] * out["rooms"]
     out["floor_per_area"] = out["floor"] / out["area"].replace(0, np.nan)
@@ -160,7 +163,7 @@ def make_temporal_folds(df: pd.DataFrame, n_folds: int = N_FOLDS) -> list[tuple[
     folds = []
     for i in range(n_folds):
         val_start = min_train + i * val_size
-        val_end = min(val_start + val_size, n_periods)
+        val_end = n_periods if i == n_folds - 1 else min(val_start + val_size, n_periods)
         if val_start >= n_periods:
             break
 
@@ -168,6 +171,7 @@ def make_temporal_folds(df: pd.DataFrame, n_folds: int = N_FOLDS) -> list[tuple[
         val_periods = set(periods[val_start:val_end])
         tr_idx = np.where(df["year_month_idx"].isin(train_periods))[0]
         val_idx = np.where(df["year_month_idx"].isin(val_periods))[0]
+
         if len(tr_idx) > 0 and len(val_idx) > 0:
             folds.append((tr_idx, val_idx))
 
@@ -176,38 +180,38 @@ def make_temporal_folds(df: pd.DataFrame, n_folds: int = N_FOLDS) -> list[tuple[
 
 def add_temporal_market_features(train: pd.DataFrame, test: pd.DataFrame,
 folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # Средняя цена рынка по прошлым месяцам
     train = train.copy()
     test = test.copy()
     train["market_price_past"] = np.nan
 
     for tr_idx, val_idx in folds:
-        tr = train.iloc[tr_idx]
-        month_mean = tr.groupby("year_month_idx")["price"].mean().sort_index()
-        past_by_month = month_mean.expanding().mean().shift(1)
-        fallback = tr["price"].mean()
+        month_mean = train.iloc[tr_idx].groupby("year_month_idx")["price"].mean()
+        train.loc[val_idx, "market_price_past"] = month_mean.mean()
 
-        val_months = train.iloc[val_idx]["year_month_idx"]
-        train.iloc[val_idx, train.columns.get_loc("market_price_past")] = (
-            val_months.map(past_by_month).fillna(fallback).values
-        )
+    unfilled = train["market_price_past"].isna()
+    if unfilled.any():
+        month_mean = train.loc[unfilled].groupby("year_month_idx")["price"].mean()
 
-    full_month_mean = train.groupby("year_month_idx")["price"].mean().sort_index()
-    full_past = full_month_mean.expanding().mean().shift(1)
-    fallback = train["price"].mean()
-    test["market_price_past"] = test["year_month_idx"].map(full_past).fillna(fallback)
+        for month in month_mean.index:
+            past = month_mean[month_mean.index < month]
+            if len(past) > 0:
+                train.loc[unfilled & (train["year_month_idx"] == month), "market_price_past"] = past.mean()
+
+    month_mean = train.groupby("year_month_idx")["price"].mean()
+    test["market_price_past"] = train["price"].mean()
+    for month in test["year_month_idx"].unique():
+        past = month_mean[month_mean.index < month]
+
+        if len(past) > 0:
+            test.loc[test["year_month_idx"] == month, "market_price_past"] = past.mean()
 
     return train, test
 
 
 def oof_street_encoding(train: pd.DataFrame, test: pd.DataFrame,
 folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # out-of-fold кодирование street_id; в temporal фолде train = только прошлые месяцы
     train = train.copy()
     test = test.copy()
-
-    global_mean_price = train["price"].mean()
-    global_price_per_sqm = (train["price"] / train["area"].replace(0, np.nan)).mean()
 
     enc_cols = [
         "street_price_mean",
@@ -226,11 +230,39 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[pd.DataFrame, pd.DataFrame]
             street_price_per_sqm=("price", lambda s: (s / tr.loc[s.index, "area"]).mean()),
             street_count=("price", "count"),
         )
+
         val_part = train.iloc[val_idx][["street_id"]].merge(
             stats, left_on="street_id", right_index=True, how="left"
         )
+
+        fill = {
+            "street_price_mean": tr["price"].mean(),
+            "street_price_median": tr["price"].median(),
+            "street_price_per_sqm": (tr["price"] / tr["area"].replace(0, np.nan)).mean(),
+            "street_count": 0,
+        }
         for col in enc_cols:
-            train.loc[val_idx, col] = val_part[col].values
+            train.iloc[val_idx, train.columns.get_loc(col)] = val_part[col].fillna(fill[col]).values
+
+    unfilled = train["street_price_mean"].isna()
+    if unfilled.any():
+        early = train.loc[unfilled]
+        stats = early.groupby("street_id").agg(
+            street_price_mean=("price", "mean"),
+            street_price_median=("price", "median"),
+            street_price_per_sqm=("price", lambda s: (s / early.loc[s.index, "area"]).mean()),
+            street_count=("price", "count"),
+        )
+        early_part = early[["street_id"]].merge(stats, left_on="street_id", right_index=True, how="left")
+        
+        fill = {
+            "street_price_mean": early["price"].mean(),
+            "street_price_median": early["price"].median(),
+            "street_price_per_sqm": (early["price"] / early["area"].replace(0, np.nan)).mean(),
+            "street_count": 0,
+        }
+        for col in enc_cols:
+            train.loc[unfilled, col] = early_part[col].fillna(fill[col]).values
 
     full_stats = train.groupby("street_id").agg(
         street_price_mean=("price", "mean"),
@@ -238,21 +270,20 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[pd.DataFrame, pd.DataFrame]
         street_price_per_sqm=("price", lambda s: (s / train.loc[s.index, "area"]).mean()),
         street_count=("price", "count"),
     )
+
     test_part = test[["street_id"]].merge(
         full_stats, left_on="street_id", right_index=True, how="left"
     )
-    for col in enc_cols:
-        test[col] = test_part[col].values
 
-    fill_map = {
-        "street_price_mean": global_mean_price,
+    fill = {
+        "street_price_mean": train["price"].mean(),
         "street_price_median": train["price"].median(),
-        "street_price_per_sqm": global_price_per_sqm,
+        "street_price_per_sqm": (train["price"] / train["area"].replace(0, np.nan)).mean(),
         "street_count": 0,
     }
-    for col, fill_val in fill_map.items():
-        train[col] = train[col].fillna(fill_val)
-        test[col] = test[col].fillna(fill_val)
+
+    for col in enc_cols:
+        test[col] = test_part[col].fillna(fill[col]).values
 
     train["street_price_by_area"] = train["street_price_per_sqm"] * train["area"]
     test["street_price_by_area"] = test["street_price_per_sqm"] * test["area"]
@@ -293,8 +324,12 @@ def get_feature_columns() -> tuple[list[str], list[str]]:
     return cat_features, num_features
 
 
-def temporal_mae(train: pd.DataFrame, pred_cv: np.ndarray) -> float:
-    mask = train["date"] >= TEMPORAL_CUTOFF
+def temporal_mae(train: pd.DataFrame, pred_cv: np.ndarray, oof_mask: np.ndarray | None = None) -> float:
+    year, month = map(int, TEMPORAL_CUTOFF.split("-"))
+    mask = train["year_month_idx"] >= year * 12 + month
+
+    if oof_mask is not None:
+        mask = mask & oof_mask
     if mask.sum() == 0:
         return float("nan")
     return mean_absolute_error(train.loc[mask, "price"], pred_cv[mask])
@@ -302,6 +337,7 @@ def temporal_mae(train: pd.DataFrame, pred_cv: np.ndarray) -> float:
 
 def prepare_xgb_frame(X: pd.DataFrame, cat_features: list[str]) -> pd.DataFrame:
     out = X.copy()
+
     for col in cat_features:
         out[col] = out[col].astype("category")
     return out
@@ -320,6 +356,8 @@ def fit_meta_weights(oof_preds: np.ndarray, y: np.ndarray) -> np.ndarray:
 
     result = minimize(objective, np.ones(n_models) / n_models, method="Nelder-Mead")
     w = np.clip(result.x, 0, None)
+    if w.sum() == 0:
+        return np.ones(n_models) / n_models
     return w / w.sum()
 
 
@@ -329,12 +367,13 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
     test_preds = np.zeros(len(X_test))
 
     for fold, (tr_idx, val_idx) in enumerate(folds, start=1):
-        model = make_catboost(RANDOM_STATE + fold)
+        model = make_catboost()
         model.fit(
             Pool(X.iloc[tr_idx], y[tr_idx], cat_features=cat_indices),
             eval_set=Pool(X.iloc[val_idx], y[val_idx], cat_features=cat_indices),
             use_best_model=True,
         )
+
         pred_cv[val_idx] = model.predict(X.iloc[val_idx])
         test_preds += model.predict(X_test) / len(folds)  # среднее по фолдам - меньше переобучение
         print(f"  CatBoost fold {fold} MAE: {mean_absolute_error(y[val_idx], pred_cv[val_idx]):,.0f}")
@@ -348,7 +387,7 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
     test_preds = np.zeros(len(X_test))
 
     for fold, (tr_idx, val_idx) in enumerate(folds, start=1):
-        model = make_lightgbm(RANDOM_STATE + fold)
+        model = make_lightgbm()
         model.fit(
             X.iloc[tr_idx],
             y[tr_idx],
@@ -357,6 +396,7 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
             categorical_feature=cat_features,
             callbacks=[lgb.early_stopping(EARLY_STOPPING, verbose=False)],
         )
+
         pred_cv[val_idx] = model.predict(X.iloc[val_idx])
         test_preds += model.predict(X_test) / len(folds)
         print(f"  LightGBM fold {fold} MAE: {mean_absolute_error(y[val_idx], pred_cv[val_idx]):,.0f}")
@@ -372,13 +412,14 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
     X_test_xgb = prepare_xgb_frame(X_test, cat_features)
 
     for fold, (tr_idx, val_idx) in enumerate(folds, start=1):
-        model = make_xgboost(RANDOM_STATE + fold)
+        model = make_xgboost()
         model.fit(
             X_xgb.iloc[tr_idx],
             y[tr_idx],
             eval_set=[(X_xgb.iloc[val_idx], y[val_idx])],
             verbose=False,
         )
+
         pred_cv[val_idx] = model.predict(X_xgb.iloc[val_idx])
         test_preds += model.predict(X_test_xgb) / len(folds)
         print(f"  XGBoost fold {fold} MAE: {mean_absolute_error(y[val_idx], pred_cv[val_idx]):,.0f}")
@@ -388,7 +429,7 @@ folds: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
 
 def train_and_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, float, np.ndarray]:
     train = add_base_features(train)
-    test = add_base_features(test)
+    test = add_base_features(test, origin_month=int(train["year_month_idx"].min()))
 
     folds = make_temporal_folds(train, N_FOLDS)
     print(f"Временных фолдов: {len(folds)}")
@@ -404,11 +445,14 @@ def train_and_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarr
     X_test = test[feature_cols]
     cat_indices = [feature_cols.index(c) for c in cat_features]
 
-    # cv: OOF для мета-весов плюс тест это среднее предсказаний по фолдам
-    cv_loaded = RESUME_FROM_CHECKPOINT and load_cv_checkpoint()
-    test_cb = load_checkpoint("test_catboost") if RESUME_FROM_CHECKPOINT else None
-    test_lgb = load_checkpoint("test_lightgbm") if RESUME_FROM_CHECKPOINT else None
-    test_xgb = load_checkpoint("test_xgboost") if RESUME_FROM_CHECKPOINT else None
+    cv_loaded = None
+    test_cb = test_lgb = test_xgb = None
+
+    if RESUME_FROM_CHECKPOINT:
+        cv_loaded = load_cv_checkpoint()
+        test_cb = load_checkpoint("test_catboost")
+        test_lgb = load_checkpoint("test_lightgbm")
+        test_xgb = load_checkpoint("test_xgboost")
 
     if cv_loaded is not None and test_cb is not None and test_lgb is not None and test_xgb is not None:
         meta_weights, temp_mae, cv_mae = cv_loaded
@@ -417,15 +461,15 @@ def train_and_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarr
               f"LightGBM={meta_weights[1]:.3f}, XGBoost={meta_weights[2]:.3f}")
         print(f"  сохранённый temporal MAE: {temp_mae:,.0f}")
     else:
-        print("\tCV: CatBoost...")
+        print("\tCV: CatBoost:")
         pred_cv_cb, test_cb = train_catboost_cv(X, y, X_test, cat_indices, folds)
         save_checkpoint("test_catboost", test_cb)
 
-        print("\tCV: LightGBM...")
+        print("\tCV: LightGBM: ")
         pred_cv_lgb, test_lgb = train_lightgbm_cv(X, y, X_test, cat_features, folds)
         save_checkpoint("test_lightgbm", test_lgb)
 
-        print("\tCV: XGBoost...")
+        print("\tCV: XGBoost:")
         pred_cv_xgb, test_xgb = train_xgboost_cv(X, y, X_test, cat_features, folds)
         save_checkpoint("test_xgboost", test_xgb)
 
@@ -438,7 +482,7 @@ def train_and_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarr
         pred_cv = oof_matrix @ meta_weights
 
         cv_mae = mean_absolute_error(y[oof_mask], pred_cv[oof_mask])
-        temp_mae = temporal_mae(train, pred_cv)
+        temp_mae = temporal_mae(train, pred_cv, oof_mask)
 
         print()
         print(f"Веса мета-модели: CatBoost={meta_weights[0]:.3f}, LightGBM={meta_weights[1]:.3f}, XGBoost={meta_weights[2]:.3f}")
@@ -446,12 +490,12 @@ def train_and_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarr
         print(f"Ensemble CV MAE (temporal OOF): {cv_mae:,.0f}")
         print(f"Ensemble MAE (>= {TEMPORAL_CUTOFF}): {temp_mae:,.0f}")
 
-        print(f"\tCatBoost OOF MAE (только val-фолды): {mean_absolute_error(y[oof_mask], pred_cv_cb[oof_mask]):,.0f}")
-        print(f"\tLightGBM OOF MAE (только val-фолды): {mean_absolute_error(y[oof_mask], pred_cv_lgb[oof_mask]):,.0f}")
-        print(f"\tXGBoost OOF MAE (только val-фолды): {mean_absolute_error(y[oof_mask], pred_cv_xgb[oof_mask]):,.0f}")
+        print(f"\tCatBoost OOF MAE: {mean_absolute_error(y[oof_mask], pred_cv_cb[oof_mask]):,.0f}")
+        print(f"\tLightGBM OOF MAE: {mean_absolute_error(y[oof_mask], pred_cv_lgb[oof_mask]):,.0f}")
+        print(f"\tXGBoost OOF MAE: {mean_absolute_error(y[oof_mask], pred_cv_xgb[oof_mask]):,.0f}")
 
         save_cv_checkpoint(meta_weights, temp_mae, cv_mae)
-        print("CV сохранён в checkpoints/")
+        print("CV сохранён в checkpoints")
 
     test_preds = (
         meta_weights[0] * test_cb
@@ -476,9 +520,11 @@ train, test = load_data()
 
 if FRESH_START and CHECKPOINT_DIR.exists():
     shutil.rmtree(CHECKPOINT_DIR)
-    print("FRESH_START: checkpoints удалены, обучение с нуля")
+    print("FRESH_START: чекпоинты удалены, обучение с нуля")
     print()
 
 predictions, temp_mae, weights = train_and_predict(train, test)
 save_submission(test, predictions)
-print(f"Готово, temporal MAE = {temp_mae:,.0f}")
+
+print(f"Готово")
+print(f"temporal MAE = {temp_mae:,.0f}")
