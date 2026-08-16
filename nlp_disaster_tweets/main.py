@@ -8,6 +8,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.metrics import recall_score, precision_score
 
+from sklearn.pipeline import FeatureUnion
+
 
 def cnt_best_threshold(model: LogisticRegression, x_val_tfidf: np.ndarray,
 y_val: np.ndarray) -> tuple[float, float]:
@@ -106,9 +108,10 @@ def main():
 
     x_train, x_val, y_train, y_val = train_test_split(x, y, test_size=0.2, random_state=42, stratify=y)
 
-    vectorizer = TfidfVectorizer(
+    word = TfidfVectorizer(
         max_features=10000,
-        ngram_range=(1, 3),
+        analyzer='word',
+        ngram_range=(1, 2),
         max_df=0.7,
         min_df=2,
         dtype=np.float32,
@@ -117,8 +120,26 @@ def main():
         sublinear_tf=True,
     )
 
+    char = TfidfVectorizer(
+        max_features=8000,
+        analyzer='char_wb',
+        ngram_range=(3, 5),
+        max_df=0.95,
+        min_df=2,
+        dtype=np.float32,
+        norm='l2',
+        use_idf=True,
+        sublinear_tf=True,
+    )
+
+    vectorizer = FeatureUnion([
+        ('word', word),
+        ('char', char),
+    ])
+
     x_train_tfidf = vectorizer.fit_transform(x_train)
     x_val_tfidf = vectorizer.transform(x_val)
+    print(x_train_tfidf.shape, x_val_tfidf.shape)
 
     model = LogisticRegression(
         class_weight='balanced',
